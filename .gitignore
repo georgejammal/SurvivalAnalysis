@@ -1,0 +1,13 @@
+.venv/
+.tmp/
+__pycache__/
+*.pyc
+
+# Large datasets (keep paths locally, don't publish)
+brca_metabric/
+DEEPSURV_METABRIC/
+
+# Checkpoints / outputs
+tjepa_metabric/checkpoints/
+evals/
+

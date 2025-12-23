@@ -123,7 +123,7 @@ def build_survival_dataset(
 
     if top_k_genes is not None and top_k_genes < X.shape[1]:
         rng = np.random.default_rng(seed)
-        # Break ties deterministically but cheaply.
+        # break ties deterministically 
         jitter = pd.Series(rng.normal(0, 1e-12, size=X.shape[1]), index=X.columns)
         variances = X.var(axis=0, skipna=True) + jitter
         keep = variances.nlargest(top_k_genes).index

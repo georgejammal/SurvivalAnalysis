@@ -8,10 +8,8 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, TensorDataset
 
-from tjepa_metabric.gene_sets import download_enrichr_library
-from tjepa_metabric.masking import FeatureMasker
+from tjepa_metabric.masking import MaskIndexSampler
 from tjepa_metabric.models import JEPA, MaskBatch
-from tjepa_metabric.pathway_features import build_pathway_dataset
 
 
 def _ensure_tmpdir():
@@ -34,7 +32,12 @@ def main():
     p.add_argument("--library", default="Reactome_2022")
     p.add_argument("--max_pathways", type=int, default=1000)
     p.add_argument("--min_overlap", type=int, default=5)
-    p.add_argument("--emb_dim", type=int, default=128)
+    p.add_argument("--token_dim", type=int, default=32)
+    p.add_argument("--mlp_hidden_dim", type=int, default=256)
+    p.add_argument("--mlp_layers", type=int, default=4)
+    p.add_argument("--n_reg_tokens", type=int, default=3)
+    p.add_argument("--no_feature_type_emb", action="store_true")
+    p.add_argument("--no_feature_index_emb", action="store_true")
     p.add_argument("--epochs", type=int, default=50)
     p.add_argument("--batch_size", type=int, default=8)
     p.add_argument("--lr", type=float, default=1e-4)
@@ -64,6 +67,9 @@ def main():
             "ER_IHC",
             "AGE_AT_DIAGNOSIS",
         ]
+        cat_feature_idx = np.array([4, 5, 6, 7], dtype=int)
+        cat_cardinalities = [2, 2, 2, 2]
+        num_feature_idx = np.array([0, 1, 2, 3, 8], dtype=int)
         ihc4_idx = np.arange(len(feature_names), dtype=int)
         ds_meta = {
             "feature_names": feature_names,
@@ -74,6 +80,9 @@ def main():
             "min_overlap": 0,
         }
     else:
+        from tjepa_metabric.gene_sets import download_enrichr_library
+        from tjepa_metabric.pathway_features import build_pathway_dataset
+
         gene_sets = download_enrichr_library(args.library)
         ds = build_pathway_dataset(
             endpoint=args.endpoint,
@@ -83,6 +92,17 @@ def main():
             seed=args.seed,
         )
         X = ds.X.to_numpy(dtype=np.float32)
+        # Treat the IHC4 binary flags as categorical and standardize only continuous features.
+        cat_names = {"HORMONE_THERAPY", "RADIO_THERAPY", "CHEMOTHERAPY", "ER_IHC"}
+        cat_feature_idx = np.array(
+            [i for i, c in enumerate(ds.X.columns) if c in cat_names], dtype=int
+        )
+        cat_cardinalities = [2 for _ in range(int(cat_feature_idx.size))]
+        num_feature_idx = np.array(
+            [i for i, c in enumerate(ds.X.columns) if c not in cat_names], dtype=int
+        )
+        if cat_feature_idx.size:
+            X[:, cat_feature_idx] = np.clip(np.rint(X[:, cat_feature_idx]), 0.0, 1.0)
         ihc4_idx = np.array(
             [ds.X.columns.get_loc(c) for c in ds.ihc4_feature_names], dtype=int
         )
@@ -95,6 +115,13 @@ def main():
             "min_overlap": args.min_overlap,
         }
 
+    # Normalize continuous features (mean 0 / std 1) like the paper, leaving categoricals as indices.
+    if num_feature_idx.size:
+        mu = X[:, num_feature_idx].mean(axis=0, keepdims=True)
+        sd = X[:, num_feature_idx].std(axis=0, keepdims=True)
+        sd[sd == 0] = 1.0
+        X[:, num_feature_idx] = (X[:, num_feature_idx] - mu) / sd
+
     n_features = X.shape[1]
 
     # Bias masking toward IHC4+C features by sampling them more often into target/context.
@@ -102,24 +129,33 @@ def main():
     if ihc4_idx.size > 0:
         w[ihc4_idx] = 8.0
 
-    masker = FeatureMasker(
+    # Repo/paper-style masking: choose context/target index-sets (drop masked features).
+    # (We keep the original biasing weights out for now; DeepSurv uses only 9 features.)
+    masker = MaskIndexSampler(
         n_features=n_features,
-        min_ctx_share=0.6,
-        max_ctx_share=0.8,
-        min_tgt_share=0.2,
-        max_tgt_share=0.4,
+        min_context_share=0.6,
+        max_context_share=0.8,
+        min_target_share=0.2,
+        max_target_share=0.4,
         allow_overlap=False,
-        feature_sampling_weights=w,
         seed=args.seed,
     )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = JEPA(
         n_features=n_features,
-        emb_dim=args.emb_dim,
+        token_dim=args.token_dim,
+        mlp_hidden_dim=args.mlp_hidden_dim,
+        mlp_layers=args.mlp_layers,
+        n_reg_tokens=args.n_reg_tokens,
+        use_feature_type_embedding=not args.no_feature_type_emb,
+        use_feature_index_embedding=not args.no_feature_index_emb,
         ema=args.ema,
         ihc4_feature_idx=ihc4_idx,
         ihc4_aux_weight=args.ihc4_aux_weight,
+        num_feature_idx=num_feature_idx,
+        cat_feature_idx=cat_feature_idx,
+        cat_cardinalities=cat_cardinalities,
     ).to(device)
     opt = torch.optim.Adam(model.parameters(), lr=args.lr)
 
@@ -135,11 +171,11 @@ def main():
         losses = []
         for (xb,) in loader:
             xb = xb.to(device)
-            mask_ctx, mask_tgt = masker.sample_masks(len(xb))
+            idx_ctx, idx_tgt = masker.sample(len(xb))
             batch = MaskBatch(
                 x=xb,
-                mask_ctx=mask_ctx.to(device),
-                mask_tgt=mask_tgt.to(device),
+                idx_ctx=idx_ctx.to(device),
+                idx_tgt=idx_tgt.to(device),
             )
             opt.zero_grad(set_to_none=True)
             loss, _ = model(batch)
@@ -155,7 +191,15 @@ def main():
     torch.save(
         {
             "state_dict": model.context_encoder.state_dict(),
-            "emb_dim": args.emb_dim,
+            "token_dim": int(args.token_dim),
+            "mlp_hidden_dim": int(args.mlp_hidden_dim),
+            "mlp_layers": int(args.mlp_layers),
+            "n_reg_tokens": int(args.n_reg_tokens),
+            "use_feature_type_embedding": bool(not args.no_feature_type_emb),
+            "use_feature_index_embedding": bool(not args.no_feature_index_emb),
+            "num_feature_idx": num_feature_idx.astype(int).tolist(),
+            "cat_feature_idx": cat_feature_idx.astype(int).tolist(),
+            "cat_cardinalities": [int(x) for x in cat_cardinalities],
             **ds_meta,
         },
         args.out,

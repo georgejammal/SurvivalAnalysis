@@ -9,12 +9,8 @@ import sys
 import numpy as np
 import torch
 from sksurv.metrics import concordance_index_censored
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler
 
-from tjepa_metabric.gene_sets import download_enrichr_library
-from tjepa_metabric.models import CoxHead, MLPEncoder, cox_ph_loss
-from tjepa_metabric.pathway_features import build_pathway_dataset
+from tjepa_metabric.models import FeatureTokenizer, ProjectionLayer, SurvivalMLP, TokenEncoder, cox_ph_loss
 
 
 def _ensure_tmpdir():
@@ -33,18 +29,34 @@ def cindex(event: np.ndarray, time: np.ndarray, risk: np.ndarray) -> float:
 def main():
     _ensure_tmpdir()
     p = argparse.ArgumentParser()
-    p.add_argument("--endpoint", choices=["OS", "RFS"], default="OS")
     p.add_argument("--ckpt", default="tjepa_metabric/checkpoints/jepa.pt")
     p.add_argument(
         "--deepsurv_h5",
-        default=None,
-        help="If set, fine-tune/evaluate on the exact DeepSurv METABRIC H5 split (OS only).",
+        required=True,
+        help="Path to DeepSurv METABRIC H5 split (IHC4+clinical, OS).",
     )
     p.add_argument("--json_out", type=str, default=None, help="Optional path to write metrics JSON.")
-    p.add_argument("--library", default="Reactome_2022")
-    p.add_argument("--max_pathways", type=int, default=1000)
-    p.add_argument("--min_overlap", type=int, default=5)
-    p.add_argument("--emb_dim", type=int, default=128)
+    p.add_argument("--token_dim", type=int, default=32)
+    p.add_argument("--token_mlp_layers", type=int, default=2)
+    p.add_argument("--predictor_hidden_dim", type=int, default=256)
+    p.add_argument(
+        "--projection",
+        choices=["mean_pool", "max_pool", "linear_flatten", "linear_per_feature"],
+        default="linear_per_feature",
+    )
+    p.add_argument("--projection_out_dim", type=int, default=None)
+    p.add_argument("--no_feature_type_emb", action="store_true")
+    p.add_argument("--no_feature_index_emb", action="store_true")
+    p.add_argument("--freeze_encoder", action="store_true")
+    p.add_argument("--head_hidden_dim", type=int, default=256)
+    p.add_argument("--head_layers", type=int, default=4)
+    p.add_argument("--head_dropout", type=float, default=0.1)
+    p.add_argument(
+        "--micro_batch_size",
+        type=int,
+        default=0,
+        help="If >0, compute risk scores in micro-batches (keeps full-batch CoxPH loss).",
+    )
     p.add_argument("--epochs", type=int, default=300)
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--seed", type=int, default=42)
@@ -53,93 +65,114 @@ def main():
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
-    if args.deepsurv_h5:
-        from tjepa_metabric.deepsurv_h5 import load_deepsurv_metabric_h5
+    from tjepa_metabric.deepsurv_h5 import load_deepsurv_metabric_h5
 
-        split = load_deepsurv_metabric_h5(args.deepsurv_h5)
-        X_train, X_test = split.X_train, split.X_test
-        t_train, t_test = split.t_train, split.t_test
-        e_train, e_test = split.e_train, split.e_test
+    split = load_deepsurv_metabric_h5(args.deepsurv_h5)
+    X_train, X_test = split.X_train, split.X_test
+    t_train, t_test = split.t_train, split.t_test
+    e_train, e_test = split.e_train, split.e_test
 
-        # No separate validation in the original setup; we report train/test.
-        X_val, t_val, e_val = X_train, t_train, e_train
-        feature_count = X_train.shape[1]
-        pathway_count = 0
-        ihc4_count = feature_count
-    else:
-        gene_sets = download_enrichr_library(args.library)
-        ds = build_pathway_dataset(
-            endpoint=args.endpoint,
-            gene_sets=gene_sets,
-            min_genes_overlap=args.min_overlap,
-            max_pathways=args.max_pathways,
-            seed=args.seed,
-        )
-        X = ds.X.to_numpy(dtype=np.float32)
-        time = ds.time.astype(np.float32)
-        event = ds.event.astype(bool)
+    # No separate validation in the original setup; we report train/test.
+    X_val, t_val, e_val = X_train, t_train, e_train
 
-        # Split with event stratification
-        X_train, X_test, t_train, t_test, e_train, e_test = train_test_split(
-            X,
-            time,
-            event,
-            test_size=0.2,
-            random_state=args.seed,
-            stratify=event.astype(int),
-        )
-        X_train, X_val, t_train, t_val, e_train, e_val = train_test_split(
-            X_train,
-            t_train,
-            e_train,
-            test_size=0.2,
-            random_state=args.seed,
-            stratify=e_train.astype(int),
-        )
+    feature_count = int(X_train.shape[1])
+    ihc4_count = feature_count
+    pathway_count = 0
 
-        scaler = StandardScaler()
-        X_train = scaler.fit_transform(X_train).astype(np.float32)
-        X_val = scaler.transform(X_val).astype(np.float32)
-        X_test = scaler.transform(X_test).astype(np.float32)
-        feature_count = X.shape[1]
-        pathway_count = len(ds.pathway_feature_names)
-        ihc4_count = len(ds.ihc4_feature_names)
+    # Fixed DeepSurv IHC4+clinical feature schema.
+    cat_feature_idx = np.array([4, 5, 6, 7], dtype=int)
+    cat_cardinalities = [2, 2, 2, 2]
+    num_feature_idx = np.array([0, 1, 2, 3, 8], dtype=int)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    encoder = MLPEncoder(
-        in_dim=X_train.shape[1] * 2,  # masked+indicator; we pass full visible mask for finetune
-        emb_dim=args.emb_dim,
-        hidden=[512, 512],
-        dropout=0.1,
+    # Allow checkpoint metadata to override CLI defaults so finetune matches pretraining.
+    ckpt_meta = {}
+    if os.path.isfile(args.ckpt):
+        ckpt_meta = torch.load(args.ckpt, map_location="cpu")
+        args.token_dim = int(ckpt_meta.get("token_dim", args.token_dim))
+        args.token_mlp_layers = int(ckpt_meta.get("mlp_layers", args.token_mlp_layers))
+        args.predictor_hidden_dim = int(ckpt_meta.get("mlp_hidden_dim", args.predictor_hidden_dim))
+        if "use_feature_type_embedding" in ckpt_meta and not args.no_feature_type_emb:
+            args.no_feature_type_emb = not bool(ckpt_meta["use_feature_type_embedding"])
+        if "use_feature_index_embedding" in ckpt_meta and not args.no_feature_index_emb:
+            args.no_feature_index_emb = not bool(ckpt_meta["use_feature_index_embedding"])
+
+    tokenizer = FeatureTokenizer(
+        n_features=feature_count,
+        num_feature_idx=num_feature_idx,
+        cat_feature_idx=cat_feature_idx,
+        cat_cardinalities=cat_cardinalities,
+        token_dim=args.token_dim,
+        use_feature_type_embedding=not args.no_feature_type_emb,
+        use_feature_index_embedding=not args.no_feature_index_emb,
     )
 
-    # Load pretrained encoder weights (if present)
+    encoder = TokenEncoder(
+        tokenizer=tokenizer,
+        token_dim=args.token_dim,
+        n_reg_tokens=0,  # discard [REG] for downstream
+        mlp_layers=args.token_mlp_layers,
+        dropout=0.1,
+    ).to(device)
+
+    projection = ProjectionLayer(
+        n_features=feature_count,
+        token_dim=args.token_dim,
+        mode=args.projection,
+        out_dim=args.projection_out_dim,
+    ).to(device)
+
+    head = SurvivalMLP(
+        in_dim=projection.out_dim,
+        hidden_dim=args.head_hidden_dim,
+        n_hidden=args.head_layers,
+        dropout=args.head_dropout,
+    ).to(device)
+
     if os.path.isfile(args.ckpt):
-        ckpt = torch.load(args.ckpt, map_location="cpu")
-        encoder.load_state_dict(ckpt["state_dict"], strict=False)
-        print(f"loaded encoder: {args.ckpt}")
+        try:
+            encoder.load_state_dict(ckpt_meta["state_dict"], strict=False)
+            print(f"loaded encoder: {args.ckpt}")
+        except RuntimeError as e:
+            print(f"WARNING: failed to load checkpoint weights ({args.ckpt}); training from scratch.")
+            print(f"  error: {e}")
     else:
         print(f"WARNING: checkpoint not found: {args.ckpt} (training from scratch)")
 
-    encoder = encoder.to(device)
-    head = CoxHead(args.emb_dim).to(device)
-    opt = torch.optim.Adam(list(encoder.parameters()) + list(head.parameters()), lr=args.lr)
+    if args.freeze_encoder:
+        for p_ in encoder.parameters():
+            p_.requires_grad = False
 
-    def to_emb(x_np: np.ndarray) -> torch.Tensor:
-        x = torch.from_numpy(x_np).to(device)
-        mask = torch.ones_like(x)
-        x2 = torch.cat([x * mask, mask], dim=1)
-        return encoder(x2)
+    opt = torch.optim.Adam(
+        list(([] if args.freeze_encoder else encoder.parameters()))
+        + list(projection.parameters())
+        + list(head.parameters()),
+        lr=args.lr,
+    )
+
+    X_train_t = torch.from_numpy(X_train).to(device)
+    X_val_t = torch.from_numpy(X_val).to(device)
+    X_test_t = torch.from_numpy(X_test).to(device)
+
+    def forward_risk(x_t: torch.Tensor) -> torch.Tensor:
+        if args.micro_batch_size and args.micro_batch_size > 0:
+            risks: list[torch.Tensor] = []
+            for i in range(0, x_t.shape[0], int(args.micro_batch_size)):
+                xb = x_t[i : i + int(args.micro_batch_size)]
+                tokens = encoder(xb, use_reg_tokens=False)  # (b, 9, H)
+                z = projection(tokens)  # (b, P)
+                risks.append(head(z))  # (b,)
+            return torch.cat(risks, dim=0)
+        tokens = encoder(x_t, use_reg_tokens=False)  # (B, 9, H)
+        z = projection(tokens)  # (B, P)
+        return head(z)  # (B,)
 
     best_val = -1.0
     best_state = None
     bad = 0
     patience = 30
 
-    Xtr = torch.from_numpy(X_train).to(device)
-    Xva = torch.from_numpy(X_val).to(device)
-    Xte = torch.from_numpy(X_test).to(device)
     ttr = torch.from_numpy(t_train).to(device)
     tva = torch.from_numpy(t_val).to(device)
     etr = torch.from_numpy(e_train).to(device)
@@ -147,25 +180,27 @@ def main():
 
     for epoch in range(1, args.epochs + 1):
         encoder.train()
+        projection.train()
         head.train()
         opt.zero_grad(set_to_none=True)
 
-        z = to_emb(X_train)
-        risk = head(z)
+        risk = forward_risk(X_train_t)
         loss = cox_ph_loss(risk, ttr, etr)
         loss.backward()
         opt.step()
 
         if epoch == 1 or epoch % 10 == 0:
             encoder.eval()
+            projection.eval()
             head.eval()
             with torch.no_grad():
-                val_risk = head(to_emb(X_val)).detach().cpu().numpy()
+                val_risk = forward_risk(X_val_t).detach().cpu().numpy()
             val_ci = cindex(e_val, t_val, val_risk)
             if val_ci > best_val + 1e-4:
                 best_val = val_ci
                 best_state = {
                     "encoder": {k: v.detach().cpu().clone() for k, v in encoder.state_dict().items()},
+                    "projection": {k: v.detach().cpu().clone() for k, v in projection.state_dict().items()},
                     "head": {k: v.detach().cpu().clone() for k, v in head.state_dict().items()},
                 }
                 bad = 0
@@ -177,28 +212,28 @@ def main():
 
     if best_state is not None:
         encoder.load_state_dict(best_state["encoder"])
+        projection.load_state_dict(best_state["projection"])
         head.load_state_dict(best_state["head"])
 
     encoder.eval()
+    projection.eval()
     head.eval()
     with torch.no_grad():
-        test_risk = head(to_emb(X_test)).detach().cpu().numpy()
-        train_risk = head(to_emb(X_train)).detach().cpu().numpy()
+        test_risk = forward_risk(X_test_t).detach().cpu().numpy()
+        train_risk = forward_risk(X_train_t).detach().cpu().numpy()
 
-    print(f"T-JEPA finetune endpoint={args.endpoint}")
+    print("T-JEPA finetune (DeepSurv METABRIC H5)")
     print(f"Train C-index: {cindex(e_train, t_train, train_risk):.4f}")
-    if not args.deepsurv_h5:
-        print(f"Val   C-index: {best_val:.4f}")
+    print(f"Val   C-index: {best_val:.4f}")
     print(f"Test  C-index: {cindex(e_test, t_test, test_risk):.4f}")
-    print(f"n_features={feature_count} (pathways={pathway_count} + ihc4={ihc4_count})")
+    print(f"n_features={feature_count} (ihc4+clinical)")
 
     if args.json_out:
         os.makedirs(os.path.dirname(args.json_out) or ".", exist_ok=True)
         payload = {
             "script": "tjepa_metabric.finetune_survival",
             "argv": sys.argv,
-            "endpoint": args.endpoint,
-            "dataset": "deepsurv_h5" if args.deepsurv_h5 else "brca_metabric",
+            "dataset": "deepsurv_h5",
             "n_features": int(feature_count),
             "n_pathways": int(pathway_count),
             "n_ihc4": int(ihc4_count),
@@ -206,21 +241,20 @@ def main():
                 "seed": args.seed,
                 "epochs": args.epochs,
                 "lr": args.lr,
-                "emb_dim": args.emb_dim,
+                "token_dim": args.token_dim,
+                "token_mlp_layers": args.token_mlp_layers,
+                "projection": args.projection,
+                "projection_out_dim": args.projection_out_dim,
+                "head_hidden_dim": args.head_hidden_dim,
+                "head_layers": args.head_layers,
+                "head_dropout": args.head_dropout,
+                "freeze_encoder": bool(args.freeze_encoder),
+                "micro_batch_size": int(args.micro_batch_size),
                 "ckpt": args.ckpt,
-                **(
-                    {}
-                    if args.deepsurv_h5
-                    else {
-                        "library": args.library,
-                        "max_pathways": args.max_pathways,
-                        "min_overlap": args.min_overlap,
-                    }
-                ),
             },
             "metrics": {
                 "c_index_train": cindex(e_train, t_train, train_risk),
-                **({} if args.deepsurv_h5 else {"c_index_val": best_val}),
+                "c_index_val": best_val,
                 "c_index_test": cindex(e_test, t_test, test_risk),
             },
         }

@@ -6,9 +6,6 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 import h5py
-import json
-import os
-import sys
 from sklearn.model_selection import train_test_split
 from sklearn.impute import SimpleImputer
 from sklearn.preprocessing import StandardScaler
@@ -88,7 +85,7 @@ def build_metabric_ihc4_like_features(
             raise ValueError(f"Missing clinical column: {col}")
         df[col] = _to_bool01(clinical2.loc[df.index, col])
 
-    # Age
+    # age
     if "AGE_AT_DIAGNOSIS" not in clinical2.columns:
         raise ValueError("Missing AGE_AT_DIAGNOSIS in clinical table.")
     df["AGE_AT_DIAGNOSIS"] = pd.to_numeric(
@@ -250,7 +247,6 @@ def main():
         default=None,
         help="If set, load the exact DeepSurv METABRIC .h5 split (overrides endpoint/features).",
     )
-    p.add_argument("--json_out", type=str, default=None, help="Optional path to write metrics JSON.")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--epochs", type=int, default=500)
     p.add_argument("--lr", type=float, default=0.0020065103592061526)
@@ -338,36 +334,6 @@ def main():
         print(f"Val   C-index: {best_val:.4f}")
     print(f"Test  C-index: {cindex(split.y_test, test_risk):.4f}")
     print("Features:", ", ".join(split.feature_names))
-
-    if args.json_out:
-        os.makedirs(os.path.dirname(args.json_out) or ".", exist_ok=True)
-        payload = {
-            "script": "survival.deepsurv_baseline",
-            "argv": sys.argv,
-            "endpoint": args.endpoint,
-            "dataset": "deepsurv_h5" if args.deepsurv_h5 else "brca_metabric",
-            "n_features": int(split.X_train.shape[1]),
-            "features": split.feature_names,
-            "n_train": int(split.X_train.shape[0]),
-            "n_val": int(split.X_val.shape[0]),
-            "n_test": int(split.X_test.shape[0]),
-            "hyperparams": {
-                "seed": args.seed,
-                "epochs": args.epochs,
-                "lr": args.lr,
-                "dropout": args.dropout,
-                "l2_reg_loss": args.weight_decay,
-                "hidden": hidden,
-            },
-            "metrics": {
-                "c_index_train": cindex(split.y_train, train_risk),
-                **({"c_index_val": best_val} if use_early_stop else {}),
-                "c_index_test": cindex(split.y_test, test_risk),
-            },
-        }
-        with open(args.json_out, "w") as f:
-            json.dump(payload, f, indent=2)
-        print(f"wrote: {args.json_out}")
 
 
 if __name__ == "__main__":
